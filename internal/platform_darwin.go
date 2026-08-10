@@ -226,10 +226,40 @@ func NewPlatformTray(callbacks *Callbacks) PlatformTray {
 	}
 }
 
-// Create initializes the NSStatusBar item and sets up click handling.
-func (t *darwinTray) Create() error {
+// ensureNSApplicationLaunched initializes the shared NSApplication and
+// finishes launching it before any NSStatusItem is created. Creating a
+// status item before the app launch completes crashes with a
+// "CGSConnectionByID" assertion (known macOS pattern: status items must not
+// be created before applicationDidFinishLaunching). Idempotent; safe to call
+// from Create() and Run().
+func (t *darwinTray) ensureNSApplicationLaunched() {
 	initDarwinSels()
 	initDarwinClasses()
+
+	if !t.nsApp.IsNil() {
+		return
+	}
+
+	// Get or create the shared NSApplication.
+	t.nsApp = darwinClasses.NSApplication.Send(darwinSels.sharedApplication)
+	if t.nsApp.IsNil() {
+		return
+	}
+
+	// Set activation policy to accessory (no dock icon for tray-only apps).
+	t.nsApp.SendInt(darwinSels.setActivationPolicy, nsApplicationActivationPolicyAccessory)
+
+	// Finish launching is required before the event loop can process events
+	// and before the window-server connection is available for UI objects.
+	t.nsApp.Send(darwinSels.finishLaunching)
+}
+
+// Create initializes the NSStatusBar item and sets up click handling.
+func (t *darwinTray) Create() error {
+	// NSApplication must be launched before creating the status item;
+	// otherwise AppKit aborts in CGSConnectionByID when the process has no
+	// window-server connection yet (crashes on daemonized/background launches).
+	t.ensureNSApplicationLaunched()
 
 	// Get the system status bar.
 	t.statusBar = darwinClasses.NSStatusBar.Send(darwinSels.systemStatusBar)
@@ -780,20 +810,12 @@ func (t *darwinTray) Bounds() (int, int, int, int) {
 // run. Only call Run() once per process: the shared NSApplication event loop
 // serves all tray icons.
 func (t *darwinTray) Run() error {
-	initDarwinSels()
-	initDarwinClasses()
-
-	// Get or create the shared NSApplication.
-	t.nsApp = darwinClasses.NSApplication.Send(darwinSels.sharedApplication)
+	// Initialize and finish-launch the shared NSApplication (already done
+	// by Create() in the common flow; idempotent).
+	t.ensureNSApplicationLaunched()
 	if t.nsApp.IsNil() {
 		return errors.New("darwin: failed to get NSApplication")
 	}
-
-	// Set activation policy to accessory (no dock icon for tray-only apps).
-	t.nsApp.SendInt(darwinSels.setActivationPolicy, nsApplicationActivationPolicyAccessory)
-
-	// Finish launching is required before the event loop can process events.
-	t.nsApp.Send(darwinSels.finishLaunching)
 
 	// Run the Cocoa event loop. This blocks until [NSApp stop:] is sent and
 	// the wake event posted by Destroy() is processed.
