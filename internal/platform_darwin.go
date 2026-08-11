@@ -226,10 +226,36 @@ func NewPlatformTray(callbacks *Callbacks) PlatformTray {
 	}
 }
 
-// Create initializes the NSStatusBar item and sets up click handling.
-func (t *darwinTray) Create() error {
+// ensureNSApplicationLaunched initializes the shared NSApplication and
+// finishes launching it before any NSStatusItem is created. Creating a
+// status item before the app launch completes crashes with a
+// "CGSConnectionByID" assertion (known macOS pattern: status items must not
+// be created before applicationDidFinishLaunching). All steps are idempotent,
+// safe to call from Create() and Run().
+func ensureNSApplicationLaunched() {
 	initDarwinSels()
 	initDarwinClasses()
+
+	// Get or create the shared NSApplication.
+	nsApp := darwinClasses.NSApplication.Send(darwinSels.sharedApplication)
+	if nsApp.IsNil() {
+		return
+	}
+
+	// Set activation policy to accessory (no dock icon for tray-only apps).
+	nsApp.SendInt(darwinSels.setActivationPolicy, nsApplicationActivationPolicyAccessory)
+
+	// Finish launching is required before the event loop can process events
+	// and before the window-server connection is available for UI objects.
+	nsApp.Send(darwinSels.finishLaunching)
+}
+
+// Create initializes the NSStatusBar item and sets up click handling.
+func (t *darwinTray) Create() error {
+	// NSApplication must be launched before creating the status item;
+	// otherwise AppKit aborts in CGSConnectionByID when the process has no
+	// window-server connection yet.
+	ensureNSApplicationLaunched()
 
 	// Get the system status bar.
 	t.statusBar = darwinClasses.NSStatusBar.Send(darwinSels.systemStatusBar)
