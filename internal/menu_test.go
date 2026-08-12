@@ -1,6 +1,8 @@
 package internal
 
 import (
+	"bytes"
+	"sync/atomic"
 	"testing"
 )
 
@@ -412,6 +414,170 @@ func TestSetMenuUpdater_NilMenu(t *testing.T) {
 
 	// Should not panic.
 	SetMenuUpdater(nil, &mockUpdater{})
+}
+
+func TestMenuItemSetUpdaterNilDetachesLegacyUpdater(t *testing.T) {
+	t.Parallel()
+
+	item := NewMenu().Add("item", nil)
+	calls := 0
+	item.SetUpdater(&mockUpdater{onUpdate: func(*MenuItem) { calls++ }})
+	item.SetUpdater(nil)
+
+	item.SetLabel("detached")
+
+	if calls != 0 {
+		t.Fatalf("detached updater calls = %d, want 0", calls)
+	}
+}
+
+func TestMenuItemUpdateUsesMutationSnapshot(t *testing.T) {
+	t.Parallel()
+
+	item := NewMenu().Add("original", nil)
+	updater := &blockingSnapshotUpdater{
+		entered:  make(chan struct{}),
+		release:  make(chan struct{}),
+		observed: make(chan menuItemSnapshot, 2),
+	}
+	setMenuSnapshotUpdater(&Menu{Items: []*MenuItem{item}}, updater)
+
+	done := make(chan struct{})
+	go func() {
+		item.SetLabel("queued")
+		close(done)
+	}()
+
+	<-updater.entered
+	item.SetDisabled(true)
+	close(updater.release)
+	<-done
+
+	var labelUpdate, disabledUpdate menuItemSnapshot
+	for range 2 {
+		update := <-updater.observed
+		if update.disabled {
+			disabledUpdate = update
+		} else {
+			labelUpdate = update
+		}
+	}
+
+	if labelUpdate.label != "queued" || labelUpdate.disabled {
+		t.Fatalf("label update = {label:%q disabled:%v}, want mutation-time state", labelUpdate.label, labelUpdate.disabled)
+	}
+	if disabledUpdate.label != "queued" || !disabledUpdate.disabled {
+		t.Fatalf("disabled update = {label:%q disabled:%v}, want coherent later state", disabledUpdate.label, disabledUpdate.disabled)
+	}
+}
+
+func TestMenuItemDispatchAllowsReentrantSetter(t *testing.T) {
+	t.Parallel()
+
+	item := NewMenu().Add("item", nil)
+	var updates []menuItemSnapshot
+	updater := snapshotUpdaterFunc(func(update menuItemSnapshot) error {
+		updates = append(updates, update)
+		if len(updates) == 1 {
+			item.SetDisabled(true)
+		}
+		return nil
+	})
+	setMenuSnapshotUpdater(&Menu{Items: []*MenuItem{item}}, updater)
+
+	item.SetLabel("updated")
+
+	if len(updates) != 2 {
+		t.Fatalf("updates = %d, want initial and reentrant mutation", len(updates))
+	}
+	if updates[0].disabled || !updates[1].disabled {
+		t.Fatalf("disabled states = [%v, %v], want [false, true]", updates[0].disabled, updates[1].disabled)
+	}
+}
+
+func TestLegacyUpdaterPreservesIdentityAndReentrancy(t *testing.T) {
+	t.Parallel()
+
+	item := NewMenu().Add("item", nil)
+	calls := 0
+	item.SetUpdater(&mockUpdater{onUpdate: func(got *MenuItem) {
+		calls++
+		if got != item {
+			t.Errorf("UpdateItem item = %p, want canonical %p", got, item)
+		}
+		if calls == 1 {
+			got.SetDisabled(true)
+		}
+	}})
+
+	item.SetLabel("updated")
+
+	if calls != 2 {
+		t.Fatalf("updater calls = %d, want initial and reentrant mutation", calls)
+	}
+	if !item.IsDisabled() {
+		t.Fatal("reentrant mutation was not retained")
+	}
+}
+
+func TestMenuItemIconSnapshotsOwnBytes(t *testing.T) {
+	t.Parallel()
+
+	initial := []byte{1, 2, 3}
+	item := NewMenu().AddWithIcon("icon", initial, nil)
+	initial[0] = 9
+	if got := item.snapshot().icon; !bytes.Equal(got, []byte{1, 2, 3}) {
+		t.Fatalf("initial icon = %v, want owned copy", got)
+	}
+
+	updater := &blockingSnapshotUpdater{
+		entered:  make(chan struct{}),
+		release:  make(chan struct{}),
+		observed: make(chan menuItemSnapshot, 1),
+	}
+	setMenuSnapshotUpdater(&Menu{Items: []*MenuItem{item}}, updater)
+
+	icon := []byte{4, 5, 6}
+	done := make(chan struct{})
+	go func() {
+		item.SetIcon(icon)
+		close(done)
+	}()
+
+	<-updater.entered
+	icon[0] = 8
+	close(updater.release)
+	<-done
+
+	update := <-updater.observed
+	if !bytes.Equal(update.icon, []byte{4, 5, 6}) {
+		t.Fatalf("queued icon = %v, want mutation-time owned copy", update.icon)
+	}
+	if got := item.snapshot().icon; !bytes.Equal(got, []byte{4, 5, 6}) {
+		t.Fatalf("stored icon = %v, want owned copy", got)
+	}
+}
+
+type blockingSnapshotUpdater struct {
+	calls    atomic.Uint32
+	entered  chan struct{}
+	release  chan struct{}
+	observed chan menuItemSnapshot
+}
+
+type snapshotUpdaterFunc func(menuItemSnapshot) error
+
+func (f snapshotUpdaterFunc) updateItem(item menuItemSnapshot) error {
+	return f(item)
+}
+
+func (u *blockingSnapshotUpdater) updateItem(item menuItemSnapshot) error {
+	if u.calls.Add(1) == 1 {
+		close(u.entered)
+		<-u.release
+	}
+	u.observed <- item
+	return nil
 }
 
 // mockUpdater implements MenuItemUpdater for testing.
