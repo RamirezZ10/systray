@@ -38,7 +38,7 @@ func getMenuItemInfo(t *testing.T, hmenu uintptr, uItem uintptr, byPosition bool
 	return windows.UTF16ToString(buf), mii.fState
 }
 
-// newTestWin32Tray builds a real Win32 tray without creating the message-only
+// newTestWin32Tray builds a real Win32 tray without creating the hidden
 // window: buildHMENU/populateMenu/UpdateItem do not require an HWND.
 func newTestWin32Tray() *win32Tray {
 	return NewPlatformTray(nil).(*win32Tray)
@@ -274,5 +274,26 @@ func TestPopulateMenu_NilSubmenu_DoesNotShiftPositions(t *testing.T) {
 	}
 	if pos != 1 {
 		t.Errorf("container position = %d, want 1", pos)
+	}
+}
+
+func TestHide_ClearsWanted(t *testing.T) {
+	tray := newTestWin32Tray()
+	tray.wanted = true
+
+	if err := tray.Hide(); err != nil {
+		t.Fatalf("Hide() error: %v", err)
+	}
+	if tray.wanted {
+		t.Error("wanted = true after Hide(), want false")
+	}
+}
+
+func TestReAddIcon_NotWanted_NoOp(t *testing.T) {
+	tray := newTestWin32Tray()
+
+	tray.reAddIcon()
+	if tray.visible {
+		t.Error("visible = true after reAddIcon() with wanted=false, want false")
 	}
 }

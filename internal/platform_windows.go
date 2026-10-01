@@ -93,8 +93,9 @@ const (
 	mfsDisabled = 0x00000003
 )
 
-// HWND_MESSAGE parent for message-only windows.
-const hwndMessage = ^uintptr(2) // (HWND)-3 = HWND_MESSAGE
+// WS_EX_TOOLWINDOW keeps the hidden tray window out of Alt-Tab.
+// A top-level window is required: HWND_MESSAGE windows miss broadcasts (TaskbarCreated).
+const wsExToolWindow = 0x00000080
 
 // ChangeWindowMessageFilterEx constants (Windows 7+, UIPI).
 const (
@@ -227,7 +228,7 @@ type notifyIconIdentifier struct {
 }
 
 // trayRegistry maps HWND to tray instance for wndProc routing.
-// Multiple tray icons each have their own message-only window.
+// Multiple tray icons each have their own hidden window.
 var (
 	trayMu       sync.RWMutex
 	trayRegistry = make(map[uintptr]*win32Tray)
@@ -246,11 +247,12 @@ var taskbarCreatedMsg uint32
 
 // win32Tray implements PlatformTray using Shell_NotifyIconW.
 type win32Tray struct {
-	hwnd     uintptr // message-only window for tray callbacks
+	hwnd     uintptr // hidden top-level window for tray callbacks
 	uid      uint32  // icon ID passed to Shell_NotifyIconW
 	hicon    uintptr // current HICON handle
 	hmenu    uintptr // current HMENU handle for context menu
 	visible  bool    // whether icon has been added to tray
+	wanted   bool    // Show() requested; re-registered on TaskbarCreated
 	iconData []byte  // stored PNG for explorer crash recovery (light mode icon)
 	iconDark []byte  // dark mode icon PNG for automatic theme switching
 	tooltip  string  // stored tooltip for explorer crash recovery
@@ -276,7 +278,7 @@ func NewPlatformTray(callbacks *Callbacks) PlatformTray {
 }
 
 // Create initializes the Win32 tray: registers the window class (once),
-// creates a message-only window, and registers the TaskbarCreated message.
+// creates a hidden window, and registers the TaskbarCreated message.
 func (t *win32Tray) Create() error {
 	classOnce.Do(func() {
 		errClassRegister = registerTrayWindowClass()
@@ -313,7 +315,7 @@ func (t *win32Tray) Create() error {
 }
 
 // registerTrayWindowClass registers the window class used by all tray
-// message-only windows. Called once via sync.Once.
+// hidden windows. Called once via sync.Once.
 func registerTrayWindowClass() error {
 	// Register TaskbarCreated for explorer crash recovery.
 	msgName, err := windows.UTF16PtrFromString("TaskbarCreated")
@@ -347,7 +349,7 @@ func registerTrayWindowClass() error {
 	return nil
 }
 
-// createMessageWindow creates an HWND_MESSAGE window for tray callbacks
+// createMessageWindow creates a hidden top-level window for tray callbacks
 // and registers the tray instance in the global registry.
 func createMessageWindow(t *win32Tray) (uintptr, error) {
 	className, err := windows.UTF16PtrFromString("GoGPUSystrayMsg")
@@ -358,15 +360,15 @@ func createMessageWindow(t *win32Tray) (uintptr, error) {
 	hinstance, _, _ := procGetModuleHandleW.Call(0)
 
 	hwnd, _, _ := procCreateWindowExW.Call(
-		0,                                  // dwExStyle
+		wsExToolWindow,                     // dwExStyle
 		uintptr(unsafe.Pointer(className)), // lpClassName
 		0,                                  // lpWindowName (none needed)
-		0,                                  // dwStyle
+		0,                                  // dwStyle (never shown)
 		0, 0, 0, 0,                         // x, y, w, h
-		hwndMessage, // hWndParent = HWND_MESSAGE
-		0,           // hMenu
-		hinstance,   // hInstance
-		0,           // lpParam
+		0,         // hWndParent = none (top-level, receives broadcasts)
+		0,         // hMenu
+		hinstance, // hInstance
+		0,         // lpParam
 	)
 	if hwnd == 0 {
 		return 0, fmt.Errorf("CreateWindowExW HWND_MESSAGE failed")
@@ -526,6 +528,7 @@ func (t *win32Tray) ShowNotification(title, message string) error {
 // If a dark mode icon is set, the initial icon is chosen based on the
 // current system theme (dark or light).
 func (t *win32Tray) Show() error {
+	t.wanted = true
 	if t.visible {
 		return nil
 	}
@@ -535,7 +538,11 @@ func (t *win32Tray) Show() error {
 
 	ret, _, _ := procShellNotifyIconW.Call(nimAdd, uintptr(unsafe.Pointer(&nid)))
 	if ret == 0 {
-		return fmt.Errorf("Shell_NotifyIconW NIM_ADD failed")
+		// Icon may already be registered (repeated TaskbarCreated); avoid duplicates.
+		ret, _, _ = procShellNotifyIconW.Call(nimModify, uintptr(unsafe.Pointer(&nid)))
+		if ret == 0 {
+			return fmt.Errorf("Shell_NotifyIconW NIM_ADD failed")
+		}
 	}
 
 	// Set NOTIFYICON_VERSION_4 for proper event behavior.
@@ -556,6 +563,7 @@ func (t *win32Tray) Show() error {
 
 // Hide removes the icon from the tray without destroying the window.
 func (t *win32Tray) Hide() error {
+	t.wanted = false
 	if !t.visible {
 		return nil
 	}
@@ -690,10 +698,10 @@ func (t *win32Tray) modifyIcon() error {
 	return nil
 }
 
-// reAddIcon re-creates the tray icon after explorer.exe crash/restart.
-// Selects the correct icon (dark or light) based on the current theme.
+// reAddIcon re-creates the tray icon after explorer.exe start/restart.
+// Also retries a Show() that failed because the taskbar was not ready.
 func (t *win32Tray) reAddIcon() {
-	if !t.visible {
+	if !t.wanted {
 		return
 	}
 
@@ -886,7 +894,7 @@ func (t *win32Tray) updateItem(item menuItemSnapshot) error {
 
 // --- Window procedure ---
 
-// trayWndProc handles messages for tray message-only windows.
+// trayWndProc handles messages for tray hidden windows.
 func trayWndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 	// Look up the tray instance for this HWND.
 	trayMu.RLock()

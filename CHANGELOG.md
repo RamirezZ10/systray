@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Windows: tray icon missing at boot or after Explorer restart.** The tray window was `HWND_MESSAGE`, which never receives the `TaskbarCreated` broadcast. It is now a hidden top-level tool window. A `Show()` that failed because the taskbar was not ready is retried on `TaskbarCreated`, and re-registration falls back to `NIM_MODIFY` to avoid duplicate icons. This also lets the `WM_SETTINGCHANGE` dark-mode broadcast arrive.
+
 ## [0.3.0] - 2026-08-30
 
 ### Added
