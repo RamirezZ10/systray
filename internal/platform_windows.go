@@ -62,6 +62,14 @@ const (
 	wmCommand       = 0x0111
 	wmDestroy       = 0x0002
 	wmSettingChange = 0x001A
+	wmTimer         = 0x0113
+)
+
+// Show retry while the notification area is not ready (boot / explorer restart).
+const (
+	showRetryTimerID  = 1
+	showRetryInterval = 2000 // ms
+	showRetryMax      = 30   // ~1 minute per TaskbarCreated
 )
 
 // TrackPopupMenu flags.
@@ -144,6 +152,8 @@ var (
 	procShellNotifyIconGetRect      = shell32.NewProc("Shell_NotifyIconGetRect")
 	procSetMenuItemInfoW            = user32.NewProc("SetMenuItemInfoW")
 	procPostQuitMessage             = user32.NewProc("PostQuitMessage")
+	procSetTimer                    = user32.NewProc("SetTimer")
+	procKillTimer                   = user32.NewProc("KillTimer")
 )
 
 // menuItemInfoW is the Win32 MENUITEMINFOW structure for SetMenuItemInfoW.
@@ -253,6 +263,7 @@ type win32Tray struct {
 	hmenu    uintptr // current HMENU handle for context menu
 	visible  bool    // whether icon has been added to tray
 	wanted   bool    // Show() requested; re-registered on TaskbarCreated
+	retries  int     // pending Show retries since last TaskbarCreated
 	iconData []byte  // stored PNG for explorer crash recovery (light mode icon)
 	iconDark []byte  // dark mode icon PNG for automatic theme switching
 	tooltip  string  // stored tooltip for explorer crash recovery
@@ -539,11 +550,14 @@ func (t *win32Tray) Show() error {
 	ret, _, _ := procShellNotifyIconW.Call(nimAdd, uintptr(unsafe.Pointer(&nid)))
 	if ret == 0 {
 		// Icon may already be registered (repeated TaskbarCreated); avoid duplicates.
-		ret, _, _ = procShellNotifyIconW.Call(nimModify, uintptr(unsafe.Pointer(&nid)))
+		var err error
+		ret, _, err = procShellNotifyIconW.Call(nimModify, uintptr(unsafe.Pointer(&nid)))
 		if ret == 0 {
-			return fmt.Errorf("Shell_NotifyIconW NIM_ADD failed")
+			t.scheduleShowRetry()
+			return fmt.Errorf("Shell_NotifyIconW NIM_ADD failed: %w", err)
 		}
 	}
+	t.retries = 0
 
 	// Set NOTIFYICON_VERSION_4 for proper event behavior.
 	nid.uVersion = notifyIconVersion4
@@ -559,6 +573,19 @@ func (t *win32Tray) Show() error {
 	t.updateIconForTheme()
 
 	return nil
+}
+
+// scheduleShowRetry arms a one-shot timer to retry Show(), up to showRetryMax times.
+// Reusing the same timer ID replaces a pending one, so retries never stack.
+func (t *win32Tray) scheduleShowRetry() {
+	if t.retries >= showRetryMax {
+		slog.Warn("systray: giving up tray icon registration", "attempts", t.retries)
+		return
+	}
+	t.retries++
+	if ret, _, _ := procSetTimer.Call(t.hwnd, showRetryTimerID, showRetryInterval, 0); ret == 0 {
+		slog.Warn("systray: SetTimer for tray icon retry failed")
+	}
 }
 
 // Hide removes the icon from the tray without destroying the window.
@@ -701,9 +728,11 @@ func (t *win32Tray) modifyIcon() error {
 // reAddIcon re-creates the tray icon after explorer.exe start/restart.
 // Also retries a Show() that failed because the taskbar was not ready.
 func (t *win32Tray) reAddIcon() {
+	slog.Debug("systray: TaskbarCreated received", "wanted", t.wanted)
 	if !t.wanted {
 		return
 	}
+	t.retries = 0
 
 	// Re-create HICON from the theme-appropriate stored PNG.
 	if t.hicon == 0 {
@@ -915,6 +944,18 @@ func trayWndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 	switch msg {
 	case wmTrayCallback:
 		return t.handleTrayMessage(lParam)
+
+	case wmTimer:
+		if wParam != showRetryTimerID {
+			ret, _, _ := procDefWindowProcW.Call(hwnd, uintptr(msg), wParam, lParam)
+			return ret
+		}
+		_, _, _ = procKillTimer.Call(hwnd, showRetryTimerID)
+		if t.wanted && !t.visible {
+			// Failure re-arms the timer via scheduleShowRetry.
+			_ = t.Show()
+		}
+		return 0
 
 	case wmCommand:
 		// Menu item selected via WM_COMMAND (non-TPM_RETURNCMD path).

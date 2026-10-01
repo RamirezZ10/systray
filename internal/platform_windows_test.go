@@ -297,3 +297,13 @@ func TestReAddIcon_NotWanted_NoOp(t *testing.T) {
 		t.Error("visible = true after reAddIcon() with wanted=false, want false")
 	}
 }
+
+func TestScheduleShowRetry_StopsAtMax(t *testing.T) {
+	tray := newTestWin32Tray()
+	tray.retries = showRetryMax
+
+	tray.scheduleShowRetry()
+	if tray.retries != showRetryMax {
+		t.Errorf("retries = %d after max reached, want %d", tray.retries, showRetryMax)
+	}
+}

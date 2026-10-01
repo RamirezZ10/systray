@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Windows: tray icon missing at boot or after Explorer restart.** The tray window was `HWND_MESSAGE`, which never receives the `TaskbarCreated` broadcast. It is now a hidden top-level tool window. A `Show()` that failed because the taskbar was not ready is retried on `TaskbarCreated`, and re-registration falls back to `NIM_MODIFY` to avoid duplicate icons. This also lets the `WM_SETTINGCHANGE` dark-mode broadcast arrive.
+- **Windows: tray icon missing at boot or after Explorer restart.** The tray window was `HWND_MESSAGE`, which never receives the `TaskbarCreated` broadcast. It is now a hidden top-level tool window. A `Show()` that failed because the taskbar was not ready is retried on `TaskbarCreated`, and re-registration falls back to `NIM_MODIFY` to avoid duplicate icons. This also lets the `WM_SETTINGCHANGE` dark-mode broadcast arrive. If the notification area is still not ready, registration retries on a one-shot timer (every 2s, at most 30 attempts per `TaskbarCreated`).
 
 ## [0.3.0] - 2026-08-30
 
